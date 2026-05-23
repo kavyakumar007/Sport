@@ -1,196 +1,346 @@
+"""
+Cricket No-Ball Detector
+========================
+Detects whether a bowler's delivery is a NO BALL or LEGAL based on
+front-foot position relative to the popping crease.
+
+Usage:
+    python noball_detector.py --image path/to/frame.png [--roi] [--debug]
+
+Arguments:
+    --image   Path to the input image/frame
+    --roi     Launch the ROI picker (click to print coordinates, then close)
+    --debug   Show all intermediate debug windows
+"""
+
 import cv2
 import numpy as np
+import argparse
+import sys
 
-# ------------ 0. LOAD IMAGE ------------
-img = cv2.imread(r"C:\Users\91854\OneDrive\Pictures\Screenshots\Screenshot 2025-11-28 234538.png")
-if img is None:
-    print("Image not loaded!")
-    exit()
 
-print("Image shape:", img.shape)  #to avoid out of bound errors
+# ──────────────────────────────────────────────────────────
+# CONFIG  (edit these after running with --roi)
+# ──────────────────────────────────────────────────────────
+DEFAULT_ROI = (120, 320, 520, 640)   # x1, y1, x2, y2
+FOOT_BOTTOM_FRACTION = 0.55          # keep only the bottom N% of ROI for foot
+SAT_THRESH           = 40            # HSV saturation threshold (shadow filter)
+MIN_CONTOUR_AREA     = 200           # pixels²
+CREASE_MARGIN_PX     = 3             # tolerance around crease
+MIN_LINE_LENGTH      = 80
+MAX_LINE_GAP         = 10
+CANNY_LOW, CANNY_HIGH = 50, 150
+# ──────────────────────────────────────────────────────────
 
-# ------------ 1. CROP ROI -------------
-ROI_Y1, ROI_Y2 = 320, 640
-ROI_X1, ROI_X2 = 120, 520
 
-roi = img[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
-if roi is None or roi.size == 0:
-    print("ROI empty, adjust coordinates!")
-    exit()
+def pick_roi(image_path: str) -> None:
+    """Interactive helper: click on image to print (x, y) coordinates."""
+    img = cv2.imread(image_path)
+    if img is None:
+        sys.exit(f"[ERROR] Cannot load image: {image_path}")
 
-# ------------ 2. PREPROCESS ------------
-roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-roi_blur = cv2.GaussianBlur(roi_gray, (5, 5), 0)
+    print("[ROI PICKER] Click on image to get coordinates. Press any key to exit.")
 
-# ------------ 3. CREASE DETECTION (Hough) ------------
-edges = cv2.Canny(roi_blur, 50, 150)
+    def on_click(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            print(f"  Clicked  X={x}, Y={y}")
 
-lines = cv2.HoughLinesP(
-    edges,
-    rho=1,
-    theta=np.pi / 180,
-    threshold=50,
-    minLineLength=80,
-    maxLineGap=10
-)
-
-best_line = None
-max_length = 0
-
-if lines is not None:
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        dx = x2 - x1
-        dy = y2 - y1
-
-        # keep only mostly vertical lines
-        if abs(dx) < 20:
-            length = np.hypot(dx, dy)
-            if length > max_length:
-                max_length = length
-                best_line = (x1, y1, x2, y2)
-
-if best_line is None:
-    print("No crease line detected – tune Hough/Canny.")
-    cv2.imshow("ROI", roi)
-    cv2.imshow("Edges", edges)
+    cv2.imshow("ROI Picker – press any key to close", img)
+    cv2.setMouseCallback("ROI Picker – press any key to close", on_click)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
-    exit()
 
-x1, y1, x2, y2 = best_line
 
-# draw crease on ROI and full image
-cv2.line(roi, (x1, y1), (x2, y2), (0, 255, 0), 2)
-X1, Y1 = x1 + ROI_X1, y1 + ROI_Y1
-X2, Y2 = x2 + ROI_X1, y2 + ROI_Y1
-cv2.line(img, (X1, Y1), (X2, Y2), (0, 0, 255), 2)
+def detect_crease(roi_blur: np.ndarray, roi_gray: np.ndarray) -> tuple | None:
+    """Return (x1, y1, x2, y2) of the best vertical crease line, or None."""
+    edges = cv2.Canny(roi_blur, CANNY_LOW, CANNY_HIGH)
 
-# since line is vertical, x of crease is approximately constant
-crease_x_roi = int((x1 + x2) / 2)
-print("Crease line (ROI coords):", best_line, "crease_x_roi:", crease_x_roi)
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=50,
+        minLineLength=MIN_LINE_LENGTH,
+        maxLineGap=MAX_LINE_GAP,
+    )
 
-# ------------ 4. FOOT CANDIDATE MASK (dark + bottom) ------------
-# Otsu + inverse: dark = white
-_, th = cv2.threshold(
-    roi_blur, 0, 255,
-    cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-)
+    best_line, max_len = None, 0
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            dx = x2 - x1
+            if abs(dx) < 20:                          # mostly vertical
+                length = np.hypot(dx, y2 - y1)
+                if length > max_len:
+                    max_len = length
+                    best_line = (x1, y1, x2, y2)
 
-h, w = th.shape
-foot_mask = np.zeros_like(th)
-bottom_start = int(h * 0.55)          # keep only bottom part of ROI
-foot_mask[bottom_start:h, :] = th[bottom_start:h, :]
+    return best_line, edges
 
-kernel = np.ones((5, 5), np.uint8)
-foot_clean = cv2.morphologyEx(foot_mask, cv2.MORPH_OPEN, kernel)
-foot_clean = cv2.morphologyEx(foot_clean, cv2.MORPH_CLOSE, kernel)
 
-# ------------ 5. SHADOW REDUCTION (HSV saturation) ------------
-hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-H, S, V = cv2.split(hsv)
+def build_foot_mask(roi: np.ndarray, roi_blur: np.ndarray) -> tuple:
+    """Return (foot_candidate mask, sat_mask, th, foot_clean) for the given ROI."""
+    h, w = roi_blur.shape
 
-sat_thresh = 40   # tune if needed
-_, sat_mask = cv2.threshold(S, sat_thresh, 255, cv2.THRESH_BINARY)
+    # --- Otsu threshold (dark pixels = foreground) ---
+    _, th = cv2.threshold(
+        roi_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
 
-foot_candidate = cv2.bitwise_and(foot_clean, sat_mask)
+    # Keep only the bottom portion of the ROI
+    foot_mask = np.zeros_like(th)
+    bottom_start = int(h * FOOT_BOTTOM_FRACTION)
+    foot_mask[bottom_start:, :] = th[bottom_start:, :]
 
-# ------------ 6. FOOT CONTOUR SELECTION (use crease position) ------------
-contours, _ = cv2.findContours(
-    foot_candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-)
+    # Morphological clean-up
+    kernel = np.ones((5, 5), np.uint8)
+    foot_clean = cv2.morphologyEx(foot_mask, cv2.MORPH_OPEN, kernel)
+    foot_clean = cv2.morphologyEx(foot_clean, cv2.MORPH_CLOSE, kernel)
 
-foot_contour = None
-best_score = -1
+    # Shadow suppression via HSV saturation
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    _, S, _ = cv2.split(hsv)
+    _, sat_mask = cv2.threshold(S, SAT_THRESH, 255, cv2.THRESH_BINARY)
 
-for cnt in contours:
-    area = cv2.contourArea(cnt)
-    if area < 200:
-        continue
+    foot_candidate = cv2.bitwise_and(foot_clean, sat_mask)
+    return foot_candidate, sat_mask, th, foot_clean
 
-    x, y, w_box, h_box = cv2.boundingRect(cnt)
-    aspect_ratio = w_box / float(h_box + 1e-3)
 
-    cx = x + w_box / 2.0
-    cy = y + h_box / 2.0
+def select_foot_contour(
+    foot_candidate: np.ndarray,
+    crease_x: int,
+    roi_h: int,
+) -> np.ndarray | None:
+    """Pick the contour most likely to be the front foot."""
+    contours, _ = cv2.findContours(
+        foot_candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
 
-    # 1) must be near crease horizontally (reject far-left shadow)
-    if cx < (crease_x_roi - 20) or cx > (crease_x_roi + 100):
-        continue
+    foot_contour, best_score = None, -1
 
-    # 2) must be low in the image (foot, not upper leg)
-    if (y + h_box) < 0.6 * h:
-        continue
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < MIN_CONTOUR_AREA:
+            continue
 
-    # 3) reasonable shape (not super long/flat)
-    if not (0.4 < aspect_ratio < 3.0):
-        continue
+        x, y, w_box, h_box = cv2.boundingRect(cnt)
+        aspect_ratio = w_box / float(h_box + 1e-3)
+        cx = x + w_box / 2.0
 
-    dist_to_crease = abs(cx - crease_x_roi)
-    score = area - 5 * dist_to_crease
+        # Must be near crease horizontally
+        if not (crease_x - 20 <= cx <= crease_x + 100):
+            continue
 
-    if score > best_score:
-        best_score = score
-        foot_contour = cnt
+        # Must be low in the frame (foot, not knee/hip)
+        if (y + h_box) < 0.6 * roi_h:
+            continue
 
-decision = "UNKNOWN"
+        # Reasonable bounding-box aspect ratio
+        if not (0.4 < aspect_ratio < 3.0):
+            continue
 
-if foot_contour is not None:
-    # existing stuff...
+        score = area - 5 * abs(cx - crease_x)
+        if score > best_score:
+            best_score = score
+            foot_contour = cnt
+
+    return foot_contour
+
+
+def classify_delivery(
+    foot_contour: np.ndarray,
+    crease_x: int,
+) -> tuple[str, dict]:
+    """
+    Returns (decision, debug_info).
+    decision: 'LEGAL' | 'NO BALL' | 'UNKNOWN'
+    """
+    if foot_contour is None:
+        return "UNKNOWN", {}
+
     pts = foot_contour.reshape(-1, 2)
-    # x-extents of the foot
     xs = pts[:, 0]
-    xmin = int(np.min(xs))  # leftmost point of foot in ROI
-    xmax = int(np.max(xs))  # rightmost point of foot in ROI
+    xmin, xmax = int(np.min(xs)), int(np.max(xs))
     cx = 0.5 * (xmin + xmax)
 
-    margin = 3  # tolerance in pixels
+    c = crease_x
+    m = CREASE_MARGIN_PX
 
-    # Optional: draw leftmost/rightmost for debug
-    heel_y = int(pts[np.argmin(xs), 1])
-    toe_y = int(pts[np.argmax(xs), 1])
-    cv2.circle(roi, (xmin, heel_y), 4, (0, 255, 255), -1)  # yellow: one side
-    cv2.circle(roi, (xmax, toe_y), 4, (255, 0, 0), -1)  # blue: other side
-
-    c = crease_x_roi
-
-    # ---------- NEW DIRECTION-AWARE DECISION ----------
     if cx > c:
-        # Foot mostly to the RIGHT of crease -> bowler coming from right, ball to LEFT
-        # NO BALL only if *entire* foot is left of crease
-        if xmax < c - margin:
-            decision = "NO BALL"
-        else:
-            decision = "LEGAL"
+        # Foot centre right of crease  → bowler coming from right side
+        decision = "NO BALL" if xmax < c - m else "LEGAL"
     else:
-        # Foot mostly to the LEFT of crease -> bowler coming from left, ball to RIGHT
-        # NO BALL only if *entire* foot is right of crease
-        if xmin > c + margin:
-            decision = "NO BALL"
-        else:
-            decision = "LEGAL"
-else:
-    print("No valid foot contour found – tune filters.")
+        # Foot centre left of crease   → bowler coming from left side
+        decision = "NO BALL" if xmin > c + m else "LEGAL"
 
-# put text on original image
-cv2.putText(
-    img, f"Decision: {decision}",
-    (40, 60),
-    cv2.FONT_HERSHEY_SIMPLEX,
-    1.1,
-    (0, 255, 0) if decision == "LEGAL" else (0, 0, 255),
-    2
-)
+    debug = {
+        "xmin": xmin,
+        "xmax": xmax,
+        "foot_cx": cx,
+        "crease_x": c,
+    }
+    return decision, debug
 
-# ------------ 8. SHOW DEBUG WINDOWS ------------
-cv2.imshow("ROI", roi)
-cv2.imshow("Edges", edges)
-cv2.imshow("Threshold dark", th)
-cv2.imshow("Foot mask bottom", foot_mask)
-cv2.imshow("Foot clean", foot_clean)
-cv2.imshow("Sat mask", sat_mask)
-cv2.imshow("Foot candidate", foot_candidate)
-cv2.imshow("Original with crease & decision", img)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+
+def annotate(
+    img: np.ndarray,
+    roi: np.ndarray,
+    roi_offsets: tuple,
+    crease_line: tuple,
+    foot_contour: np.ndarray | None,
+    decision: str,
+    debug_info: dict,
+) -> None:
+    """Draw crease line, foot outline, and decision text on img and roi."""
+    rx1, ry1, rx2, ry2 = roi_offsets
+    x1, y1, x2, y2 = crease_line
+
+    # Crease on ROI (green) and full image (red)
+    cv2.line(roi, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.line(img, (x1 + rx1, y1 + ry1), (x2 + rx1, y2 + ry1), (0, 0, 255), 2)
+
+    if foot_contour is not None:
+        # Foot outline
+        cv2.drawContours(roi, [foot_contour], -1, (255, 165, 0), 2)
+
+        pts = foot_contour.reshape(-1, 2)
+        xs = pts[:, 0]
+        xmin, xmax = int(np.min(xs)), int(np.max(xs))
+
+        heel_y = int(pts[np.argmin(xs), 1])
+        toe_y  = int(pts[np.argmax(xs), 1])
+        cv2.circle(roi, (xmin, heel_y), 5, (0, 255, 255), -1)   # yellow
+        cv2.circle(roi, (xmax, toe_y),  5, (255,   0,   0), -1) # blue
+
+    # Decision banner
+    color = (0, 200, 0) if decision == "LEGAL" else (0, 0, 220)
+    cv2.putText(
+        img,
+        f"Decision: {decision}",
+        (40, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+    # Small debug info in corner
+    info_lines = [
+        f"Crease X : {debug_info.get('crease_x', '?')}",
+        f"Foot xmin: {debug_info.get('xmin', '?')}",
+        f"Foot xmax: {debug_info.get('xmax', '?')}",
+    ]
+    for i, line in enumerate(info_lines):
+        cv2.putText(
+            img, line,
+            (10, img.shape[0] - 20 - i * 22),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            (200, 200, 200), 1, cv2.LINE_AA,
+        )
+
+
+# ──────────────────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────────────────
+
+def run(image_path: str, roi_coords: tuple, show_debug: bool = False) -> str:
+    img = cv2.imread(image_path)
+    if img is None:
+        sys.exit(f"[ERROR] Cannot load image: {image_path}")
+
+    print(f"[INFO] Image shape: {img.shape}")
+
+    rx1, ry1, rx2, ry2 = roi_coords
+    roi = img[ry1:ry2, rx1:rx2].copy()
+
+    if roi.size == 0:
+        sys.exit("[ERROR] ROI is empty – adjust coordinates.")
+
+    # ── Preprocessing ──
+    roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    roi_blur = cv2.GaussianBlur(roi_gray, (5, 5), 0)
+
+    # ── Crease detection ──
+    crease_line, edges = detect_crease(roi_blur, roi_gray)
+    if crease_line is None:
+        print("[WARN] No crease line detected – tune Hough/Canny parameters.")
+        if show_debug:
+            cv2.imshow("ROI",   roi)
+            cv2.imshow("Edges", edges)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        return "UNKNOWN"
+
+    crease_x = int((crease_line[0] + crease_line[2]) / 2)
+    print(f"[INFO] Crease line (ROI): {crease_line}  crease_x={crease_x}")
+
+    # ── Foot mask ──
+    foot_candidate, sat_mask, th, foot_clean = build_foot_mask(roi, roi_blur)
+
+    # ── Contour selection ──
+    h_roi = roi.shape[0]
+    foot_contour = select_foot_contour(foot_candidate, crease_x, h_roi)
+    if foot_contour is None:
+        print("[WARN] No valid foot contour found – tune filters.")
+
+    # ── Classification ──
+    decision, debug_info = classify_delivery(foot_contour, crease_x)
+    print(f"[RESULT] Decision: {decision}  |  {debug_info}")
+
+    # ── Annotate ──
+    annotate(
+        img, roi,
+        (rx1, ry1, rx2, ry2),
+        crease_line,
+        foot_contour,
+        decision,
+        debug_info,
+    )
+
+    # ── Display ──
+    cv2.imshow("No-Ball Detector – Final", img)
+    cv2.imshow("ROI with crease & foot",   roi)
+
+    if show_debug:
+        cv2.imshow("Edges",            edges)
+        cv2.imshow("Threshold (dark)", th)
+        cv2.imshow("Foot clean",       foot_clean)
+        cv2.imshow("Saturation mask",  sat_mask)
+        cv2.imshow("Foot candidate",   foot_candidate)
+
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    return decision
+
+
+# ──────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Cricket No-Ball Detector")
+    parser.add_argument("--image", required=False, help="Path to input image")
+    parser.add_argument(
+        "--roi", action="store_true",
+        help="Launch ROI picker (click to print coordinates)"
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Show intermediate debug windows"
+    )
+    parser.add_argument(
+        "--roi-coords", nargs=4, type=int,
+        metavar=("X1", "Y1", "X2", "Y2"),
+        default=list(DEFAULT_ROI),
+        help="ROI bounding box: x1 y1 x2 y2"
+    )
+    args = parser.parse_args()
+
+    if args.roi:
+        if not args.image:
+            sys.exit("[ERROR] --roi requires --image")
+        pick_roi(args.image)
+    elif args.image:
+        roi = tuple(args.roi_coords)
+        run(args.image, roi, show_debug=args.debug)
+    else:
+        parser.print_help()
 
