@@ -1,3 +1,7 @@
+import cv2
+import numpy as np
+import argparse
+import sys
 # ──────────────────────────────────────────────────────────
 # CONFIG  (edit these after running with --roi)
 # ──────────────────────────────────────────────────────────
